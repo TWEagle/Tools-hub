@@ -1,158 +1,106 @@
+# app/core.py
 from __future__ import annotations
 
-import importlib
+import json
 import os
-import subprocess
-import sys
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict
 
-from flask import Flask, send_from_directory
+from flask import Flask
 
-from .branding import Branding, load_branding
-from .theme import load_settings, load_tools
-from .health import bp as health_bp, HealthState
-from .home import bp as home_bp
-
-
-@dataclass
-class HubState:
-    branding: Branding
-    settings: Dict[str, Any]
-    tools: List[Dict[str, Any]]
+from .home import create_home_blueprint
+from .admin import create_admin_blueprint
+from .health import register_health_routes
+from .help import create_help_blueprint
 
 
-def _safe_print(msg: str) -> None:
-    # avoid unicode console crashes on work PCs
+def _read_json(path: Path, default: dict) -> dict:
     try:
-        print(str(msg))
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        try:
-            print(str(msg).encode("ascii", "ignore").decode("ascii"))
-        except Exception:
-            pass
+        pass
+    return default
 
 
-def _sort_tools(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return sorted(tools, key=lambda x: (x.get("name") or x.get("id") or "").lower())
+def _write_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def _load_registry(base_dir: Path) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    tools_cfg = load_tools(base_dir)
-    raw_tools = tools_cfg.get("tools", [])
-    if not isinstance(raw_tools, list):
-        raw_tools = []
-
-    settings = load_settings(base_dir)
-    dev_mode = bool(settings.get("dev_mode", False))
-
-    # filter hidden unless dev_mode
-    out = []
-    for t in raw_tools:
-        if not isinstance(t, dict):
-            continue
-        if t.get("hidden") and not dev_mode:
-            continue
-        out.append(t)
-
-    return tools_cfg, _sort_tools(out)
-
-
-def _register_tool_routes(app: Flask, base_dir: Path, settings: Dict[str, Any], tools: List[Dict[str, Any]]) -> None:
-    """
-    Each tool can define:
-      - "module": "cert_viewer" (imports tools.cert_viewer)
-      and inside module: register_web_routes(app, settings, tools)
-    """
-    _safe_print(">>> REGISTERING TOOL ROUTES")
-    for t in tools:
-        modname = t.get("module")
-        if not modname:
-            continue
-        try:
-            module = importlib.import_module(f"tools.{modname}")
-            fn = getattr(module, "register_web_routes", None)
-            if callable(fn):
-                fn(app, settings, tools)
-                _safe_print(f" - OK: {modname} routes registered")
-            else:
-                _safe_print(f" - SKIP: {modname} has no register_web_routes()")
-        except Exception as exc:
-            _safe_print(f" - ERROR: {modname} register failed: {exc}")
-
-
-def _gui_launcher_factory(base_dir: Path):
-    """
-    Default GUI launcher used by /start/ in home.py.
-    It runs tool["script"] with current python.
-    """
-    def launch(tool: Dict[str, Any]) -> None:
-        script = tool.get("script")
-        if not script:
-            return
-        script_path = (base_dir / script).resolve()
-        if not script_path.exists():
-            _safe_print(f"[WARN] GUI script not found: {script_path}")
-            return
-        try:
-            subprocess.Popen([sys.executable, str(script_path)], cwd=str(base_dir))
-        except Exception as e:
-            _safe_print(f"[ERROR] GUI start failed: {e}")
-
-    return launch
-
-
-def create_app(base_dir: str | Path | None = None) -> Flask:
-    """
-    App factory for run.py
-    """
-    if base_dir is None:
-        # run.py sits at repo root
-        base = Path(__file__).resolve().parents[1]
-    else:
-        base = Path(base_dir).resolve()
-
-    branding = load_branding(base)
-    settings = load_settings(base)
-    _tools_cfg, tools = _load_registry(base)
-
+def create_app(base_dir: Path) -> Flask:
     app = Flask(__name__)
-    app.secret_key = str(settings.get("secret_key", "dev-secret"))
 
-    # store state
-    st = HubState(branding=branding, settings=settings, tools=tools)
-    app.config["HUB_STATE"] = HealthState(branding=branding, settings=settings, tools=tools)
-    app.config["GUI_LAUNCHER"] = _gui_launcher_factory(base)
+    # ---- config paths
+    cfg_dir = base_dir / "config"
+    settings_path = cfg_dir / "settings.json"
+    branding_path = cfg_dir / "branding.json"
+    tools_path = cfg_dir / "tools.json"
+    help_path = cfg_dir / "help.json"
+
+    # ---- state
+    state: Dict[str, Any] = {
+        "settings": {},
+        "branding": {},
+        "tools_cfg": {"tools": []},
+        "help_cfg": {"docs": []},
+    }
+
+    def reload_all() -> None:
+        state["settings"] = _read_json(settings_path, {})
+        state["branding"] = _read_json(branding_path, {"app_title": "Centraal Portaal"})
+        state["tools_cfg"] = _read_json(tools_path, {"tools": []})
+        state["help_cfg"] = _read_json(help_path, {"docs": []})
+
+    def get_settings() -> dict:
+        return state.get("settings") or {}
+
+    def get_branding() -> dict:
+        return state.get("branding") or {}
+
+    def get_tools_cfg() -> dict:
+        return state.get("tools_cfg") or {"tools": []}
+
+    def set_tools_cfg(data: dict) -> None:
+        state["tools_cfg"] = data or {"tools": []}
+        _write_json(tools_path, state["tools_cfg"])
+
+    def get_help_cfg() -> dict:
+        return state.get("help_cfg") or {"docs": []}
+
+    def set_help_cfg(data: dict) -> None:
+        state["help_cfg"] = data or {"docs": []}
+        _write_json(help_path, state["help_cfg"])
+
+    # initial load
+    reload_all()
+
+    # secret key
+    app.secret_key = (get_settings().get("secret_key") or "dev-key").strip()
 
     # blueprints
-    app.register_blueprint(home_bp)
-    app.register_blueprint(health_bp)
+    app.register_blueprint(create_home_blueprint(get_settings, get_branding, get_tools_cfg))
+    app.register_blueprint(create_help_blueprint(base_dir, get_settings, get_branding, get_help_cfg))
+    app.register_blueprint(
+        create_admin_blueprint(
+            base_dir=base_dir,
+            settings=get_settings(),
+            branding=get_branding(),
+            get_tools_cfg=get_tools_cfg,
+            set_tools_cfg=set_tools_cfg,
+            get_help_cfg=get_help_cfg,
+            set_help_cfg=set_help_cfg,
+        )
+    )
+    
+    
+    # health
+    register_health_routes(app, get_settings, get_branding, get_tools_cfg)
 
-    # restart endpoint (reload config in-memory)
-    @app.get("/restart")
-    def restart():
-        nonlocal branding, settings, tools, st
-        branding = load_branding(base)
-        settings = load_settings(base)
-        _tools_cfg2, tools2 = _load_registry(base)
-        tools = tools2
-        st = HubState(branding=branding, settings=settings, tools=tools)
-
-        # update shared config used by blueprints
-        app.config["HUB_STATE"] = HealthState(branding=branding, settings=settings, tools=tools)
-        app.secret_key = str(settings.get("secret_key", "dev-secret"))
-
-        # re-register tool routes is tricky (Flask doesn't support clean “unregister”).
-        # For now: only refresh data (UI/settings/tools). A full restart is via launcher.
-        return "OK", 200
-
-    # Serve assets (logo/favicon/etc)
-    @app.get("/assets/<path:filename>")
-    def assets(filename: str):
-        return send_from_directory(str(base), filename)
-
-    # Register external tool routes (web tools)
-    _register_tool_routes(app, base, settings, tools)
+    # simple reload endpoint (optional)
+    @app.route("/reload")
+    def reload_route():
+        reload_all()
+        return {"status": "ok"}, 200
 
     return app

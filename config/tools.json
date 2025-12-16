@@ -1,4 +1,10 @@
 {
+  "categories": [
+    { "id": "core", "label": "Core" },
+    { "id": "cert", "label": "Certificates" },
+    { "id": "admin", "label": "Admin" },
+    { "id": "misc", "label": "Misc" }
+  ],
   "tools": [
     {
       "id": "certviewer",
