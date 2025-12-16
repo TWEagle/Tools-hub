@@ -1,0 +1,21 @@
+{
+  "brand": {
+    "id": "tools-hub",
+    "name": "Tools Hub",
+    "short_name": "Hub",
+    "company": "Internal Tools",
+    "version": "0.1.0"
+  },
+  "ui": {
+    "window_title": "{brand.name}",
+    "header_title": "{brand.name}",
+    "tray_title": "{brand.name}",
+    "footer": "© {brand.company}"
+  },
+  "cert": {
+    "common_name": "localhost",
+    "alt_names": ["localhost", "127.0.0.1", "::1"],
+    "cert_file": "tools-hub.crt",
+    "key_file": "tools-hub.key"
+  }
+}
