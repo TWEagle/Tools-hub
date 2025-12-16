@@ -1,106 +1,116 @@
 from __future__ import annotations
 
 import json
+import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict
 
-# Project root = folder that contains /app, /config, /tools, ...
-ROOT_DIR = Path(__file__).resolve().parents[1]
-CONFIG_DIR = ROOT_DIR / "config"
-BRANDING_PATH = CONFIG_DIR / "branding.json"
 
-_DEFAULT: Dict[str, Any] = {
-    "brand_id": "tools-hub",
-    "app_name": "Tools Hub",
-    "window_title": "Tools Hub",
-    "tray_title": "Tools Hub",
-    "header_title": "Tools Hub",
-    "popup_title": "Tools Hub",
-    "company": "",
-    "assets": {
-        "logo_web": "assets/logos/logo.png",
-        "logo_tray": "assets/logos/logo.png",
-        "favicon": "assets/icons/favicon.ico",
-    },
-    "cert": {
-        "common_name": "localhost",
-        "cert_filename": "localhost.crt",
-        "key_filename": "localhost.key",
-    },
-}
-
-_BRAND: Dict[str, Any] | None = None
+_TOKEN_RE = re.compile(r"\{([a-zA-Z0-9_.-]+)\}")
 
 
-def load_branding(force_reload: bool = False) -> Dict[str, Any]:
-    global _BRAND
-    if _BRAND is not None and not force_reload:
-        return _BRAND
-
-    data = dict(_DEFAULT)
-    try:
-        if BRANDING_PATH.exists():
-            raw = json.loads(BRANDING_PATH.read_text(encoding="utf-8"))
-            if isinstance(raw, dict):
-                data.update(raw)
-                # deep merge for nested dicts we care about
-                for k in ("assets", "cert"):
-                    if isinstance(_DEFAULT.get(k), dict):
-                        merged = dict(_DEFAULT[k])
-                        if isinstance(raw.get(k), dict):
-                            merged.update(raw[k])
-                        data[k] = merged
-    except Exception:
-        # keep defaults if branding is broken
-        pass
-
-    _BRAND = data
-    return data
+def _deep_get(d: Dict[str, Any], key: str, default: Any = "") -> Any:
+    cur: Any = d
+    for part in key.split("."):
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        else:
+            return default
+    return cur
 
 
-def brand() -> Dict[str, Any]:
-    return load_branding(False)
+def format_tokens(template: str, ctx: Dict[str, Any]) -> str:
+    """
+    Replaces {brand.name} etc with values from ctx.
+    Unknown tokens -> empty string.
+    """
+    if not isinstance(template, str):
+        return str(template)
+
+    def repl(m: re.Match) -> str:
+        key = m.group(1)
+        val = _deep_get(ctx, key, "")
+        return "" if val is None else str(val)
+
+    return _TOKEN_RE.sub(repl, template)
 
 
-def app_name() -> str:
-    return str(brand().get("app_name") or "Tools Hub")
+def expand_templates(obj: Any, ctx: Dict[str, Any]) -> Any:
+    """
+    Recursively expands strings containing {tokens}.
+    """
+    if isinstance(obj, str):
+        return format_tokens(obj, ctx)
+    if isinstance(obj, list):
+        return [expand_templates(x, ctx) for x in obj]
+    if isinstance(obj, dict):
+        return {k: expand_templates(v, ctx) for k, v in obj.items()}
+    return obj
 
 
-def window_title() -> str:
-    return str(brand().get("window_title") or app_name())
+@dataclass(frozen=True)
+class Branding:
+    raw: Dict[str, Any]
+    base_dir: Path
+
+    @property
+    def brand_id(self) -> str:
+        return str(self.raw.get("brand", {}).get("id", "tools-hub"))
+
+    @property
+    def name(self) -> str:
+        return str(self.raw.get("brand", {}).get("name", "Tools Hub"))
+
+    @property
+    def version(self) -> str:
+        return str(self.raw.get("brand", {}).get("version", "0.0.0"))
+
+    @property
+    def copyright(self) -> str:
+        return str(self.raw.get("brand", {}).get("copyright", ""))
+
+    def ui_value(self, key: str, default: str = "") -> str:
+        return str(self.raw.get("ui", {}).get(key, default))
+
+    def asset_path(self, key: str) -> str:
+        """
+        Returns asset path string (relative preferred).
+        """
+        return str(self.raw.get("assets", {}).get(key, ""))
+
+    def cert_filename(self, key: str, default: str) -> str:
+        return str(self.raw.get("cert", {}).get(key, default))
+
+    def cert_alt_names(self) -> list[str]:
+        alts = self.raw.get("cert", {}).get("alt_names", ["localhost", "127.0.0.1", "::1"])
+        if not isinstance(alts, list):
+            return ["localhost", "127.0.0.1", "::1"]
+        return [str(x) for x in alts if str(x).strip()]
 
 
-def tray_title() -> str:
-    return str(brand().get("tray_title") or app_name())
+def load_branding(base_dir: Path) -> Branding:
+    """
+    Loads config/branding.json and expands templates.
+    """
+    cfg_path = base_dir / "config" / "branding.json"
+    raw: Dict[str, Any] = {}
 
+    if cfg_path.exists():
+        raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+    else:
+        raw = {
+            "brand": {"id": "tools-hub", "name": "Tools Hub", "version": "0.0.0", "copyright": ""},
+            "ui": {"window_title": "{brand.name}", "header_title": "{brand.name}", "tray_title": "{brand.name}"},
+            "assets": {"logo": "", "favicon": "", "tray_icon": ""},
+            "cert": {
+                "common_name": "localhost",
+                "alt_names": ["localhost", "127.0.0.1", "::1"],
+                "cert_file": "localhost.crt",
+                "key_file": "localhost.key",
+            },
+        }
 
-def header_title() -> str:
-    return str(brand().get("header_title") or app_name())
-
-
-def popup_title() -> str:
-    return str(brand().get("popup_title") or app_name())
-
-
-def asset_path(key: str, default: str = "") -> str:
-    assets = brand().get("assets", {})
-    if isinstance(assets, dict) and assets.get(key):
-        return str(assets[key])
-    return default
-
-
-def cert_common_name() -> str:
-    c = brand().get("cert", {})
-    if isinstance(c, dict) and c.get("common_name"):
-        return str(c["common_name"])
-    return "localhost"
-
-
-def cert_filenames() -> tuple[str, str]:
-    c = brand().get("cert", {})
-    crt = "localhost.crt"
-    key = "localhost.key"
-    if isinstance(c, dict):
-        crt = str(c.get("cert_filename") or crt)
-        key = str(c.get("key_filename") or key)
-    return crt, key
+    ctx = {"brand": raw.get("brand", {}), "ui": raw.get("ui", {}), "assets": raw.get("assets", {}), "cert": raw.get("cert", {})}
+    expanded = expand_templates(raw, ctx)
+    return Branding(raw=expanded, base_dir=base_dir)

@@ -1,21 +1,27 @@
 {
   "brand": {
-    "id": "tools-hub",
-    "name": "Tools Hub",
-    "short_name": "Hub",
-    "company": "Internal Tools",
+    "id": "centraal-portaal",
+    "name": "Centraal Portaal",
+    "company": "CyNiT",
+    "copyright": "Copyright CyNiT 2024-2026",
     "version": "0.1.0"
   },
   "ui": {
     "window_title": "{brand.name}",
     "header_title": "{brand.name}",
     "tray_title": "{brand.name}",
-    "footer": "© {brand.company}"
+    "footer_text": "{brand.copyright}",
+    "show_version_in_ui": false
+  },
+  "assets": {
+    "logo": "assets/logos/logo.png",
+    "favicon": "assets/icons/favicon.ico",
+    "tray_icon": "assets/icons/tray.png"
   },
   "cert": {
     "common_name": "localhost",
     "alt_names": ["localhost", "127.0.0.1", "::1"],
-    "cert_file": "tools-hub.crt",
-    "key_file": "tools-hub.key"
+    "cert_file": "centraal-portaal.localhost.crt",
+    "key_file": "centraal-portaal.localhost.key"
   }
 }

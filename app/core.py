@@ -2,163 +2,157 @@ from __future__ import annotations
 
 import importlib
 import os
+import subprocess
 import sys
-import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List
 
-from flask import Flask, redirect, request, send_from_directory, jsonify
+from flask import Flask, send_from_directory
 
-from . import branding, theme, home, health
+from .branding import Branding, load_branding
+from .theme import load_settings, load_tools
+from .health import bp as health_bp, HealthState
+from .home import bp as home_bp
 
-ROOT_DIR = Path(__file__).resolve().parents[1]
-ASSETS_DIR = ROOT_DIR / "assets"
-CONFIG_DIR = ROOT_DIR / "config"
+
+@dataclass
+class HubState:
+    branding: Branding
+    settings: Dict[str, Any]
+    tools: List[Dict[str, Any]]
 
 
-def _safe_stdout_utf8() -> None:
+def _safe_print(msg: str) -> None:
+    # avoid unicode console crashes on work PCs
     try:
-        if hasattr(sys.stdout, "reconfigure"):
-            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        if hasattr(sys.stderr, "reconfigure"):
-            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        print(str(msg))
     except Exception:
-        pass
+        try:
+            print(str(msg).encode("ascii", "ignore").decode("ascii"))
+        except Exception:
+            pass
 
 
-def _normalize_tool_list(tools_cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
-    tools = tools_cfg.get("tools", [])
-    if not isinstance(tools, list):
-        return []
-    out: List[Dict[str, Any]] = []
-    for t in tools:
+def _sort_tools(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return sorted(tools, key=lambda x: (x.get("name") or x.get("id") or "").lower())
+
+
+def _load_registry(base_dir: Path) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    tools_cfg = load_tools(base_dir)
+    raw_tools = tools_cfg.get("tools", [])
+    if not isinstance(raw_tools, list):
+        raw_tools = []
+
+    settings = load_settings(base_dir)
+    dev_mode = bool(settings.get("dev_mode", False))
+
+    # filter hidden unless dev_mode
+    out = []
+    for t in raw_tools:
         if not isinstance(t, dict):
             continue
+        if t.get("hidden") and not dev_mode:
+            continue
         out.append(t)
-    return out
+
+    return tools_cfg, _sort_tools(out)
 
 
-def _register_tool_modules(app: Flask, settings: Dict[str, Any], tools_cfg: Dict[str, Any]) -> None:
-    tools_list = _normalize_tool_list(tools_cfg)
-
-    # Import unique python modules referenced by tools.json (script field)
-    scripts = []
-    for t in tools_list:
-        script = t.get("script")
-        if isinstance(script, str) and script.endswith(".py"):
-            scripts.append(script[:-3])
-        elif isinstance(script, str):
-            # allow bare module name
-            scripts.append(script)
-
-    for mod_name in sorted(set(scripts)):
-        if not mod_name:
+def _register_tool_routes(app: Flask, base_dir: Path, settings: Dict[str, Any], tools: List[Dict[str, Any]]) -> None:
+    """
+    Each tool can define:
+      - "module": "cert_viewer" (imports tools.cert_viewer)
+      and inside module: register_web_routes(app, settings, tools)
+    """
+    _safe_print(">>> REGISTERING TOOL ROUTES")
+    for t in tools:
+        modname = t.get("module")
+        if not modname:
             continue
-        # expected in tools/ package
         try:
-            mod = importlib.import_module(f"tools.{mod_name}")
-        except Exception as e:
-            print(f"[WARN] tool module import failed: tools.{mod_name}: {e}")
-            continue
-
-        # convention: register_web_routes(app, settings, tools_cfg)
-        fn = getattr(mod, "register_web_routes", None)
-        if callable(fn):
-            try:
-                fn(app, settings, tools_cfg)
-                print(f"[OK] routes registered: {mod_name}")
-            except Exception as e:
-                print(f"[WARN] register_web_routes failed: {mod_name}: {e}")
+            module = importlib.import_module(f"tools.{modname}")
+            fn = getattr(module, "register_web_routes", None)
+            if callable(fn):
+                fn(app, settings, tools)
+                _safe_print(f" - OK: {modname} routes registered")
+            else:
+                _safe_print(f" - SKIP: {modname} has no register_web_routes()")
+        except Exception as exc:
+            _safe_print(f" - ERROR: {modname} register failed: {exc}")
 
 
-def create_app() -> Flask:
-    _safe_stdout_utf8()
-
-    app = Flask(__name__)
-    app.secret_key = str(theme.load_settings().get("secret_key", "tools-hub-secret"))
-
-    # ---------- static assets ----------
-    @app.get("/assets/<path:subpath>")
-    def _assets(subpath: str):
-        return send_from_directory(str(ASSETS_DIR), subpath)
-
-    @app.get("/favicon.ico")
-    def _favicon():
-        fav = branding.asset_path("favicon", "assets/icons/favicon.ico")
-        # allow both /assets/... and direct file
-        if fav.startswith("assets/"):
-            return redirect("/" + fav)
-        return redirect("/assets/icons/favicon.ico")
-
-    # ---------- config images/help passthrough ----------
-    @app.get("/ABOUT.md")
-    def _about_md():
-        p = ROOT_DIR / "ABOUT.md"
-        if p.exists():
-            return p.read_text(encoding="utf-8", errors="replace"), 200, {"Content-Type": "text/plain; charset=utf-8"}
-        return "ABOUT.md missing", 404
-
-    # ---------- runtime state ----------
-    state: Dict[str, Any] = {
-        "restart_requested": False,
-    }
-
-    def reload_all() -> tuple[Dict[str, Any], Dict[str, Any]]:
-        theme.reset_cache()
-        branding.load_branding(force_reload=True)
-        settings = theme.load_settings(force_reload=True)
-        tools_cfg = theme.load_tools(force_reload=True)
-        return settings, tools_cfg
-
-    settings, tools_cfg = reload_all()
-
-    # ---------- core routes ----------
-    @app.get("/")
-    def index():
-        nonlocal settings, tools_cfg
-        settings, tools_cfg = reload_all() if settings.get("dev_mode") else (settings, tools_cfg)
-        tools_list = _normalize_tool_list(tools_cfg)
-        return home.render_home(tools=tools_list, settings=settings, dev_mode=bool(settings.get("dev_mode")))
-
-    @app.post("/start/")
-    def start_tool_gui():
-        # Keeps compatibility with your existing GUI-start flow:
-        # tools.json: id + type + script
-        tool_id = request.form.get("tool_id", "")
-        tools_list = _normalize_tool_list(tools_cfg)
-        tool = next((t for t in tools_list if str(t.get("id")) == str(tool_id)), None)
-        if not tool:
-            return "Tool not found", 404
-
+def _gui_launcher_factory(base_dir: Path):
+    """
+    Default GUI launcher used by /start/ in home.py.
+    It runs tool["script"] with current python.
+    """
+    def launch(tool: Dict[str, Any]) -> None:
         script = tool.get("script")
         if not script:
-            return "Tool script missing", 400
-
-        # We run it in a new process (best effort). GUI tools should accept --gui if needed.
-        cmd = [sys.executable, str(ROOT_DIR / "tools" / script), "--gui"]
+            return
+        script_path = (base_dir / script).resolve()
+        if not script_path.exists():
+            _safe_print(f"[WARN] GUI script not found: {script_path}")
+            return
         try:
-            import subprocess
-            subprocess.Popen(cmd, cwd=str(ROOT_DIR), creationflags=subprocess.CREATE_NEW_CONSOLE if os.name == "nt" else 0)
+            subprocess.Popen([sys.executable, str(script_path)], cwd=str(base_dir))
         except Exception as e:
-            return f"Failed to start tool: {e}", 500
-        return redirect("/")
+            _safe_print(f"[ERROR] GUI start failed: {e}")
 
-    @app.get("/reload-config")
-    def reload_config():
-        nonlocal settings, tools_cfg
-        settings, tools_cfg = reload_all()
-        return jsonify({"ok": True})
+    return launch
 
+
+def create_app(base_dir: str | Path | None = None) -> Flask:
+    """
+    App factory for run.py
+    """
+    if base_dir is None:
+        # run.py sits at repo root
+        base = Path(__file__).resolve().parents[1]
+    else:
+        base = Path(base_dir).resolve()
+
+    branding = load_branding(base)
+    settings = load_settings(base)
+    _tools_cfg, tools = _load_registry(base)
+
+    app = Flask(__name__)
+    app.secret_key = str(settings.get("secret_key", "dev-secret"))
+
+    # store state
+    st = HubState(branding=branding, settings=settings, tools=tools)
+    app.config["HUB_STATE"] = HealthState(branding=branding, settings=settings, tools=tools)
+    app.config["GUI_LAUNCHER"] = _gui_launcher_factory(base)
+
+    # blueprints
+    app.register_blueprint(home_bp)
+    app.register_blueprint(health_bp)
+
+    # restart endpoint (reload config in-memory)
     @app.get("/restart")
     def restart():
-        # Launcher should handle restart by killing process; this endpoint is just for UI convenience.
-        state["restart_requested"] = True
-        return jsonify({"ok": True})
+        nonlocal branding, settings, tools, st
+        branding = load_branding(base)
+        settings = load_settings(base)
+        _tools_cfg2, tools2 = _load_registry(base)
+        tools = tools2
+        st = HubState(branding=branding, settings=settings, tools=tools)
 
-    # ---------- health ----------
-    health.register_health(app, state)
+        # update shared config used by blueprints
+        app.config["HUB_STATE"] = HealthState(branding=branding, settings=settings, tools=tools)
+        app.secret_key = str(settings.get("secret_key", "dev-secret"))
 
-    # ---------- register tool web routes ----------
-    _register_tool_modules(app, settings, tools_cfg)
+        # re-register tool routes is tricky (Flask doesn't support clean “unregister”).
+        # For now: only refresh data (UI/settings/tools). A full restart is via launcher.
+        return "OK", 200
+
+    # Serve assets (logo/favicon/etc)
+    @app.get("/assets/<path:filename>")
+    def assets(filename: str):
+        return send_from_directory(str(base), filename)
+
+    # Register external tool routes (web tools)
+    _register_tool_routes(app, base, settings, tools)
 
     return app

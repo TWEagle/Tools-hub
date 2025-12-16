@@ -1,0 +1,31 @@
+{
+  "categories": [
+    { "id": "getting_started", "label": "Getting started" },
+    { "id": "tools", "label": "Tools" },
+    { "id": "admin", "label": "Admin" },
+    { "id": "release", "label": "Release notes" }
+  ],
+  "docs": [
+    {
+      "id": "about",
+      "title": "Over Centraal Portaal",
+      "category": "getting_started",
+      "enabled": true,
+      "path": "ABOUT.md"
+    },
+    {
+      "id": "cert_viewer_help",
+      "title": "Certificate Viewer",
+      "category": "tools",
+      "enabled": true,
+      "path": "help/tools/cert_viewer.md"
+    },
+    {
+      "id": "admin_https",
+      "title": "HTTPS op localhost",
+      "category": "admin",
+      "enabled": false,
+      "path": "help/admin/https.md"
+    }
+  ]
+}

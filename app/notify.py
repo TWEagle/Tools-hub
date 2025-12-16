@@ -1,170 +1,127 @@
-#!/usr/bin/env python3
-"""
-cynit_notify.py
-
-Eenvoudige notificatie-helper voor CyNiT Tools.
-Momenteel:
-- Signal-berichten versturen via signal-cli (alleen 'send', geen ontvangst).
-
-Config:
-- config/notify.json
-
-Voorbeeld gebruik:
-
-    from cynit_notify import send_signal_message
-
-    send_signal_message("Testje vanuit CyNiT Tools")
-"""
-
 from __future__ import annotations
 
 import json
-import shutil
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Dict, Any, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
-BASE_DIR = Path(__file__).resolve().parent
-CONFIG_DIR = BASE_DIR / "config"
-NOTIFY_CFG_PATH = CONFIG_DIR / "notify.json"
-
-
-# ==============================
-# Config laden / initialiseren
-# ==============================
-
-def _default_notify_config() -> Dict[str, Any]:
-    return {
-        "signal": {
-            "enabled": False,
-            "binary": "signal-cli",
-            "sender": "",
-            "default_recipients": [],
-            "timeout_sec": 15
-        }
-    }
-
-
-def load_notify_config() -> Dict[str, Any]:
-    """
-    Leest config/notify.json.
-    - Bestaat hij niet -> aanmaken met defaults (enabled = false).
-    """
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-
-    if not NOTIFY_CFG_PATH.exists():
-        data = _default_notify_config()
-        NOTIFY_CFG_PATH.write_text(
-            json.dumps(data, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-        return data
-
-    try:
-        raw = json.loads(NOTIFY_CFG_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        raw = _default_notify_config()
-        NOTIFY_CFG_PATH.write_text(
-            json.dumps(raw, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-
-    # heel simpele merge, zodat nieuwe keys niet kapot gaan
-    dflt = _default_notify_config()
-    dflt.update(raw)
-    if "signal" in raw and isinstance(raw["signal"], dict):
-        sig = dict(dflt["signal"])
-        sig.update(raw["signal"])
-        dflt["signal"] = sig
-
-    return dflt
-
-
-_NOTIFY_CFG: Dict[str, Any] = load_notify_config()
-
-
-def reload_notify_config() -> None:
-    """
-    Optioneel: callen als je notify.json via de config-editor aanpast.
-    """
-    global _NOTIFY_CFG
-    _NOTIFY_CFG = load_notify_config()
-
-
-# ==============================
-# Signal helpers
-# ==============================
-
-class SignalError(RuntimeError):
+class NotifyError(RuntimeError):
     pass
 
 
-def _get_signal_cfg() -> Dict[str, Any]:
-    sig = _NOTIFY_CFG.get("signal") or {}
-    if not isinstance(sig, dict):
-        raise SignalError("Ongeldige 'signal' sectie in notify.json")
-    return sig
+@dataclass
+class NotifyConfig:
+    enabled: bool
+    # Signal
+    signal_cli_path: str
+    signal_sender: str
+    default_recipients: List[str]
 
-
-def send_signal_message(
-    message: str,
-    recipients: Optional[Iterable[str]] = None,
-) -> None:
-    """
-    Verstuur een Signal-bericht via signal-cli.
-
-    - message: tekst van het bericht
-    - recipients: iterable van telefoonnummers (inclusief landcode),
-                  laat leeg om default_recipients uit config te gebruiken.
-
-    Raises:
-        SignalError bij misconfiguratie of falende signal-cli.
-    """
-    sig = _get_signal_cfg()
-
-    if not sig.get("enabled", False):
-        raise SignalError("Signal-notificaties zijn uitgeschakeld in notify.json.")
-
-    sender = (sig.get("sender") or "").strip()
-    if not sender:
-        raise SignalError("Geen 'sender' ingesteld in notify.json (signal.sender).")
-
-    default_recipients = sig.get("default_recipients") or []
-    if recipients is None:
-        recips: List[str] = list(default_recipients)
-    else:
-        recips = [r.strip() for r in recipients if str(r).strip()]
-
-    if not recips:
-        raise SignalError("Geen ontvangers opgegeven en geen default_recipients in notify.json.")
-
-    binary = (sig.get("binary") or "signal-cli").strip()
-    timeout_sec = int(sig.get("timeout_sec", 15))
-
-    if not shutil.which(binary):
-        raise SignalError(
-            f"signal-cli binary '{binary}' niet gevonden in PATH. "
-            "Controleer notify.json of installeer signal-cli."
+    @staticmethod
+    def from_dict(d: Dict[str, Any]) -> "NotifyConfig":
+        d = d or {}
+        return NotifyConfig(
+            enabled=bool(d.get("enabled", False)),
+            signal_cli_path=str(d.get("signal_cli_path") or "signal-cli"),
+            signal_sender=str(d.get("signal_sender") or ""),
+            default_recipients=[str(x).strip() for x in (d.get("default_recipients") or []) if str(x).strip()],
         )
 
-    cmd = [binary, "-u", sender, "send", "-m", message]
-    cmd.extend(recips)
+
+def load_notify_config(base_dir: Path) -> NotifyConfig:
+    """
+    Reads config/notify.json. If absent: disabled.
+    Example notify.json:
+    {
+      "enabled": true,
+      "signal_cli_path": "C:/path/signal-cli.bat",
+      "signal_sender": "+32....",
+      "default_recipients": ["+32...."]
+    }
+    """
+    path = base_dir / "config" / "notify.json"
+    if not path.exists():
+        return NotifyConfig.from_dict({"enabled": False})
 
     try:
-        result = subprocess.run(
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return NotifyConfig.from_dict({"enabled": False})
+        return NotifyConfig.from_dict(data)
+    except Exception:
+        return NotifyConfig.from_dict({"enabled": False})
+
+
+def _run(cmd: List[str], cwd: Path) -> Tuple[int, str]:
+    """
+    Runs a command and returns (exitcode, combined_output).
+    """
+    try:
+        p = subprocess.run(
             cmd,
+            cwd=str(cwd),
             capture_output=True,
             text=True,
-            timeout=timeout_sec,
+            errors="replace",
+            shell=False,
         )
-    except subprocess.TimeoutExpired as exc:
-        raise SignalError(f"signal-cli timeout na {timeout_sec}s: {exc}") from exc
-    except Exception as exc:
-        raise SignalError(f"Kon signal-cli niet uitvoeren: {exc}") from exc
+        out = (p.stdout or "") + ("\n" + p.stderr if p.stderr else "")
+        return int(p.returncode), out.strip()
+    except Exception as e:
+        return 999, str(e)
 
-    if result.returncode != 0:
-        raise SignalError(
-            "signal-cli faalde "
-            f"(exit {result.returncode}).\nSTDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}"
-        )
+
+def send_signal(
+    base_dir: Path,
+    message: str,
+    recipients: Optional[List[str]] = None,
+    raise_on_fail: bool = False,
+) -> bool:
+    """
+    Sends a Signal message via signal-cli.
+    Returns True if sent, False otherwise.
+    """
+    cfg = load_notify_config(base_dir)
+    if not cfg.enabled:
+        return False
+
+    msg = (message or "").strip()
+    if not msg:
+        if raise_on_fail:
+            raise NotifyError("Signal message is empty")
+        return False
+
+    recips = recipients or cfg.default_recipients
+    recips = [str(r).strip() for r in (recips or []) if str(r).strip()]
+    if not recips:
+        if raise_on_fail:
+            raise NotifyError("No Signal recipients configured")
+        return False
+
+    if not cfg.signal_sender:
+        if raise_on_fail:
+            raise NotifyError("notify.json missing signal_sender")
+        return False
+
+    # signal-cli -u <sender> send -m "msg" <recip1> <recip2>
+    cmd = [cfg.signal_cli_path, "-u", cfg.signal_sender, "send", "-m", msg] + recips
+    code, out = _run(cmd, base_dir)
+
+    ok = (code == 0)
+    if not ok and raise_on_fail:
+        raise NotifyError(f"Signal failed (exit={code}): {out}")
+    return ok
+
+
+def notify(
+    base_dir: Path,
+    message: str,
+    recipients: Optional[List[str]] = None,
+) -> bool:
+    """
+    Generic notify entrypoint (currently Signal).
+    Later you can extend this with Telegram/Teams/etc without changing callers.
+    """
+    return send_signal(base_dir, message, recipients=recipients, raise_on_fail=False)
