@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 from typing import Any, Dict
 
@@ -31,24 +30,22 @@ def _write_json(path: Path, data: dict) -> None:
 def create_app(base_dir: Path) -> Flask:
     app = Flask(__name__)
 
-    # ---- config paths
     cfg_dir = base_dir / "config"
     settings_path = cfg_dir / "settings.json"
     branding_path = cfg_dir / "branding.json"
     tools_path = cfg_dir / "tools.json"
     help_path = cfg_dir / "help.json"
 
-    # ---- state
     state: Dict[str, Any] = {
         "settings": {},
-        "branding": {},
+        "branding": {"app_title": "Centraal Portaal", "copyright": "© CyNiT 2024-2026"},
         "tools_cfg": {"tools": []},
         "help_cfg": {"docs": []},
     }
 
     def reload_all() -> None:
         state["settings"] = _read_json(settings_path, {})
-        state["branding"] = _read_json(branding_path, {"app_title": "Centraal Portaal"})
+        state["branding"] = _read_json(branding_path, {"app_title": "Centraal Portaal", "copyright": "© CyNiT 2024-2026"})
         state["tools_cfg"] = _read_json(tools_path, {"tools": []})
         state["help_cfg"] = _read_json(help_path, {"docs": []})
 
@@ -56,7 +53,7 @@ def create_app(base_dir: Path) -> Flask:
         return state.get("settings") or {}
 
     def get_branding() -> dict:
-        return state.get("branding") or {}
+        return state.get("branding") or {"app_title": "Centraal Portaal", "copyright": "© CyNiT 2024-2026"}
 
     def get_tools_cfg() -> dict:
         return state.get("tools_cfg") or {"tools": []}
@@ -72,7 +69,6 @@ def create_app(base_dir: Path) -> Flask:
         state["help_cfg"] = data or {"docs": []}
         _write_json(help_path, state["help_cfg"])
 
-    # initial load
     reload_all()
 
     # secret key
@@ -84,20 +80,18 @@ def create_app(base_dir: Path) -> Flask:
     app.register_blueprint(
         create_admin_blueprint(
             base_dir=base_dir,
-            settings=get_settings(),
-            branding=get_branding(),
+            get_settings=get_settings,
+            get_branding=get_branding,
             get_tools_cfg=get_tools_cfg,
             set_tools_cfg=set_tools_cfg,
             get_help_cfg=get_help_cfg,
             set_help_cfg=set_help_cfg,
         )
     )
-    
-    
+
     # health
     register_health_routes(app, get_settings, get_branding, get_tools_cfg)
 
-    # simple reload endpoint (optional)
     @app.route("/reload")
     def reload_route():
         reload_all()
