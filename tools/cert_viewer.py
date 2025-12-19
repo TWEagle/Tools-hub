@@ -2,13 +2,21 @@
 """
 tools/cert_viewer.py
 
-Certificate / CSR Viewer (brand-agnostic) voor Tools Hub.
+Certificate / CSR Viewer (brand-agnostic) for the Tools Hub.
 
 Routes:
 - GET/POST  /cert
 - GET       /cert/download/<fmt>      (json|csv|html|md|xlsx)
 - GET       /cert/download/zip_all
 - GET       /cert/save_md
+
+Integration:
+    from tools.cert_viewer import create_blueprint
+    app.register_blueprint(create_blueprint(get_settings, get_branding, get_tools_cfg))
+
+Depends:
+- cryptography
+- openpyxl (only for XLSX export in app.exports)
 """
 
 from __future__ import annotations
@@ -26,10 +34,11 @@ from flask import Blueprint, request, render_template_string, make_response, sen
 from cryptography import x509
 from cryptography.hazmat.primitives.asymmetric import rsa, dsa, ec
 
-# --- Central layout (preferred) ---
+# --- central layout + exports (Tools Hub) ---
 try:
     from app.layout import common_css, header_html, footer_html, common_js
-except Exception:  # fallback minimal
+except Exception:  # pragma: no cover
+    # fallback for standalone testing
     def common_css(settings: dict) -> str:
         return "body{font-family:Arial,sans-serif;background:#0b0b0b;color:#ddd;margin:0} .page{padding:20px}"
     def header_html(settings: dict, title: str, tools: list | None = None, right_html: str = "") -> str:
@@ -39,12 +48,14 @@ except Exception:  # fallback minimal
     def common_js() -> str:
         return ""
 
-# --- Central exports (preferred) ---
 try:
     from app import exports as hub_exports
-except Exception:
+except Exception:  # pragma: no cover
     hub_exports = None
 
+# -----------------------------
+# helpers
+# -----------------------------
 _B64_RE = re.compile(r"^[A-Za-z0-9+/=\s]+$")
 
 
@@ -53,6 +64,7 @@ def _now_utc() -> datetime:
 
 
 def _strip_xml_wrapper(s: str) -> str:
+    # sometimes certs are pasted from XML payloads; strip tags if present
     return re.sub(r"<[^>]+>", "", s)
 
 
@@ -77,7 +89,11 @@ def _normalize_pem(text: str) -> str:
 
 
 def load_cert_or_csr(data: bytes) -> Tuple[str, Any]:
-    text: Optional[str] = None
+    """
+    Detect PEM/DER as CERT or CSR.
+    Return ("cert", x509.Certificate) or ("csr", x509.CertificateSigningRequest)
+    """
+    text: Optional[str]
     try:
         text = data.decode("utf-8", errors="ignore")
     except Exception:
@@ -101,7 +117,7 @@ def load_cert_or_csr(data: bytes) -> Tuple[str, Any]:
             cert = x509.load_pem_x509_certificate(data)
             return "cert", cert
 
-        # plain base64 -> DER
+        # “plain base64” (DER) in text
         der = _try_base64_to_der_bytes(stripped)
         if der:
             try:
@@ -126,7 +142,7 @@ def load_cert_or_csr(data: bytes) -> Tuple[str, Any]:
 def _name_to_dict(name: x509.Name) -> Dict[str, str]:
     out: Dict[str, str] = {}
     for attr in name:
-        key = attr.oid._name or attr.oid.dotted_string
+        key = getattr(attr.oid, "_name", None) or attr.oid.dotted_string
         out[key] = attr.value
     return out
 
@@ -155,14 +171,11 @@ def decode_cert_from_bytes(data: bytes, filename: str = "input") -> Dict[str, An
     kind, obj = load_cert_or_csr(data)
 
     info: Dict[str, Any] = {
-        # compat: jouw exports gebruikte "type"
-        "type": kind,
         "kind": kind,
-
         "filename": filename,
         "decoded_at_utc": _now_utc().isoformat(),
         "subject": {},
-        "issuer": None,   # CSR: None zodat "CSR heeft geen issuer" logic klopt
+        "issuer": {},
         "properties": {},
         "extensions": [],
         "checks": [],
@@ -175,49 +188,62 @@ def decode_cert_from_bytes(data: bytes, filename: str = "input") -> Dict[str, An
 
         props = info["properties"]
         props["serial_number"] = str(cert.serial_number)
+        # cryptography exposes naive datetimes; normalise to UTC in output
         props["not_valid_before_utc"] = cert.not_valid_before.replace(tzinfo=timezone.utc).isoformat()
         props["not_valid_after_utc"] = cert.not_valid_after.replace(tzinfo=timezone.utc).isoformat()
         props["signature_hash"] = _hash_name(cert.signature_hash_algorithm)
         props["public_key"] = _pubkey_summary(cert.public_key())
 
+        # basic checks
         now = _now_utc()
         if cert.not_valid_before.replace(tzinfo=timezone.utc) > now:
-            info["checks"].append({"name": "validity", "status": "WARN", "message": "Certificate is nog niet geldig (not_before ligt in de toekomst)."})
+            info["checks"].append(
+                {"name": "validity", "status": "WARN", "message": "Certificate is nog niet geldig (not_before ligt in de toekomst)."}
+            )
         if cert.not_valid_after.replace(tzinfo=timezone.utc) < now:
-            info["checks"].append({"name": "validity", "status": "FAIL", "message": "Certificate is verlopen (not_after ligt in het verleden)."})
+            info["checks"].append(
+                {"name": "validity", "status": "FAIL", "message": "Certificate is verlopen (not_after ligt in het verleden)."}
+            )
         if not info["checks"]:
             info["checks"].append({"name": "validity", "status": "OK", "message": "Validity window OK t.o.v. huidige UTC tijd."})
 
+        # extensions (stringified; capped)
         for ext in cert.extensions:
-            info["extensions"].append({
-                "oid": ext.oid.dotted_string,
-                "name": getattr(ext.oid, "_name", None) or "extension",
-                "critical": bool(ext.critical),
-                "value": str(ext.value)[:8000],
-            })
+            info["extensions"].append(
+                {
+                    "oid": ext.oid.dotted_string,
+                    "name": getattr(ext.oid, "_name", None) or "extension",
+                    "critical": bool(ext.critical),
+                    "value": str(ext.value)[:8000],
+                }
+            )
 
     else:
         csr: x509.CertificateSigningRequest = obj
         info["subject"] = _name_to_dict(csr.subject)
-        info["issuer"] = None
-
+        info["issuer"] = {}  # CSR has no issuer
         props = info["properties"]
         props["signature_hash"] = _hash_name(csr.signature_hash_algorithm)
         props["public_key"] = _pubkey_summary(csr.public_key())
 
         for ext in csr.extensions:
-            info["extensions"].append({
-                "oid": ext.oid.dotted_string,
-                "name": getattr(ext.oid, "_name", None) or "extension",
-                "critical": bool(ext.critical),
-                "value": str(ext.value)[:8000],
-            })
+            info["extensions"].append(
+                {
+                    "oid": ext.oid.dotted_string,
+                    "name": getattr(ext.oid, "_name", None) or "extension",
+                    "critical": bool(ext.critical),
+                    "value": str(ext.value)[:8000],
+                }
+            )
 
         info["checks"].append({"name": "issuer", "status": "INFO", "message": "CSR heeft geen issuer (wordt pas ingevuld bij certificate issuance)."})
 
     return info
 
 
+# -----------------------------
+# Blueprint factory
+# -----------------------------
 def create_blueprint(get_settings, get_branding, get_tools_cfg) -> Blueprint:
     bp = Blueprint("cert_viewer", __name__)
 
@@ -234,13 +260,12 @@ def create_blueprint(get_settings, get_branding, get_tools_cfg) -> Blueprint:
         tools_cfg = get_tools_cfg() or {"tools": []}
         tools = tools_cfg.get("tools", []) if isinstance(tools_cfg, dict) else []
 
-        title = (branding.get("titles", {}) or {}).get("cert_viewer") \
-            or branding.get("app_title") \
-            or "Certificate / CSR Viewer"
+        titles = branding.get("titles", {}) if isinstance(branding, dict) else {}
+        page_title = titles.get("cert_viewer") or "Certificate / CSR Viewer"
 
         base_css = common_css(settings)
         js = common_js()
-        header = header_html(settings, title=title, tools=tools, right_html="")
+        header = header_html(settings, title=page_title, tools=tools, right_html="")
         footer = footer_html(settings)
 
         error = None
@@ -421,7 +446,7 @@ def create_blueprint(get_settings, get_branding, get_tools_cfg) -> Blueprint:
             js=js,
             header=header,
             footer=footer,
-            page_title=title,
+            page_title=page_title,
             error=error,
             info=info_obj,
         )
@@ -437,50 +462,30 @@ def create_blueprint(get_settings, get_branding, get_tools_cfg) -> Blueprint:
         base_name = Path(info.get("filename", "certificate")).stem or "certificate"
         fmt = (fmt or "").lower().strip()
 
-        # JSON direct
         if fmt == "json":
             content = json.dumps(info, indent=2, ensure_ascii=False)
-            resp = make_response(content)
-            resp.headers["Content-Type"] = "application/json; charset=utf-8"
-            resp.headers["Content-Disposition"] = f'attachment; filename="{base_name}.json"'
-            return resp
+            return hub_exports.send_text_download(f"{base_name}.json", content, mimetype="application/json; charset=utf-8") if hub_exports else make_response(content, 200)
 
-        # CSV (via hub_exports als die build heeft, anders simpele fallback)
         if fmt == "csv":
             if hub_exports and hasattr(hub_exports, "build_csv_text"):
-                content = hub_exports.build_csv_text(info)
-            else:
-                lines = ["Section;Field;Value"]
-                for sec_key, sec_name in [("subject", "Subject"), ("issuer", "Issuer"), ("properties", "Properties")]:
-                    section = info.get(sec_key)
-                    if not isinstance(section, dict):
-                        continue
-                    for k, v in section.items():
-                        lines.append(f"{sec_name};{k};{str(v).replace(';', ',')}")
-                content = "\n".join(lines)
+                content = hub_exports.build_csv_text(info, settings=settings, branding=branding)
+                return hub_exports.send_text_download(f"{base_name}.csv", content, mimetype="text/csv; charset=utf-8")
+            # fallback
+            content = "Section;Field;Value\n"
+            return hub_exports.send_text_download(f"{base_name}.csv", content, mimetype="text/csv; charset=utf-8") if hub_exports else make_response(content, 200)
 
-            resp = make_response(content)
-            resp.headers["Content-Type"] = "text/csv; charset=utf-8"
-            resp.headers["Content-Disposition"] = f'attachment; filename="{base_name}.csv"'
-            return resp
+        if fmt == "html":
+            html_out = hub_exports.build_html_export(info, settings=settings, branding=branding) if hub_exports else "<pre>" + json.dumps(info, indent=2, ensure_ascii=False) + "</pre>"
+            return hub_exports.send_text_download(f"{base_name}.html", html_out, mimetype="text/html; charset=utf-8") if hub_exports else make_response(html_out, 200)
 
-        # HTML / MD / XLSX / ZIP via centrale exports (asap)
-        if hub_exports and hasattr(hub_exports, "build_html_export") and fmt == "html":
-            html_out = hub_exports.build_html_export(info, settings, branding)
-            return make_response(html_out, 200, {
-                "Content-Type": "text/html; charset=utf-8",
-                "Content-Disposition": f'attachment; filename="{base_name}.html"',
-            })
+        if fmt == "md":
+            md = hub_exports.build_markdown_export(info, settings=settings, branding=branding) if hub_exports else "```json\n" + json.dumps(info, indent=2, ensure_ascii=False) + "\n```"
+            return hub_exports.send_text_download(f"{base_name}.md", md, mimetype="text/markdown; charset=utf-8") if hub_exports else make_response(md, 200)
 
-        if hub_exports and hasattr(hub_exports, "build_markdown_export") and fmt == "md":
-            md = hub_exports.build_markdown_export(info, settings, branding)
-            return make_response(md, 200, {
-                "Content-Type": "text/markdown; charset=utf-8",
-                "Content-Disposition": f'attachment; filename="{base_name}.md"',
-            })
-
-        if hub_exports and hasattr(hub_exports, "build_xlsx_export") and fmt == "xlsx":
-            data = hub_exports.build_xlsx_export(info, settings, branding)
+        if fmt == "xlsx":
+            if not hub_exports:
+                return make_response("XLSX export unavailable (exports module missing).", 500)
+            data = hub_exports.build_xlsx_export(info, settings=settings, branding=branding)
             buf = BytesIO(data)
             buf.seek(0)
             return send_file(
@@ -490,7 +495,7 @@ def create_blueprint(get_settings, get_branding, get_tools_cfg) -> Blueprint:
                 mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
-        return make_response("Exporttype nog niet beschikbaar (exports module nog niet uitgebreid).", 400)
+        return make_response("Onbekend exporttype.", 400)
 
     @bp.route("/cert/download/zip_all", methods=["GET"])
     def zip_all():
@@ -499,12 +504,11 @@ def create_blueprint(get_settings, get_branding, get_tools_cfg) -> Blueprint:
         info = session.get("cert_last_info")
         if not info:
             return make_response("Nog geen certificaat/CSR gedecodeerd in deze sessie.", 400)
-
-        if not (hub_exports and hasattr(hub_exports, "build_zip_bytes")):
-            return make_response("ZIP export nog niet beschikbaar (exports module nog niet uitgebreid).", 400)
+        if not hub_exports:
+            return make_response("ZIP export unavailable (exports module missing).", 500)
 
         formats = ["json", "csv", "xlsx", "html", "md"]
-        zip_bytes = hub_exports.build_zip_bytes(info, settings, branding, formats)
+        zip_bytes = hub_exports.build_zip_bytes(info, settings=settings, branding=branding, formats=formats)
         base_name = Path(info.get("filename", "certificate")).stem or "certificate"
 
         buf = BytesIO(zip_bytes)
@@ -518,19 +522,19 @@ def create_blueprint(get_settings, get_branding, get_tools_cfg) -> Blueprint:
         info = session.get("cert_last_info")
         if not info:
             return make_response("Nog geen certificaat/CSR gedecodeerd in deze sessie.", 400)
-
-        if not (hub_exports and hasattr(hub_exports, "ensure_exports_dir") and hasattr(hub_exports, "build_markdown_export")):
-            return make_response("Save MD nog niet beschikbaar (exports module nog niet uitgebreid).", 400)
+        if not hub_exports:
+            return make_response("Save MD unavailable (exports module missing).", 500)
 
         hub_exports.ensure_exports_dir()
+        exports_dir = getattr(hub_exports, "EXPORTS_DIR", Path("exports"))
 
         orig_name = info.get("filename", "certificate")
-        slug = hub_exports.slugify_filename(orig_name) if hasattr(hub_exports, "slugify_filename") else (Path(orig_name).stem or "certificate")
+        slug = hub_exports.slugify_filename(orig_name, default="certificate")
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         filename = f"{slug}_{ts}.md"
-        dest = hub_exports.EXPORTS_DIR / filename
+        dest = Path(exports_dir) / filename
 
-        md = hub_exports.build_markdown_export(info, settings, branding)
+        md = hub_exports.build_markdown_export(info, settings=settings, branding=branding)
         dest.write_text(md, encoding="utf-8")
 
         return make_response(
@@ -543,3 +547,22 @@ def create_blueprint(get_settings, get_branding, get_tools_cfg) -> Blueprint:
         )
 
     return bp
+
+
+if __name__ == "__main__":  # pragma: no cover
+    from flask import Flask
+
+    app = Flask(__name__)
+    app.secret_key = "dev"
+
+    def _settings():
+        return {"colors": {"background": "#0b0b0b", "general_fg": "#ddd", "title": "#9cff9c"}}
+
+    def _branding():
+        return {"app_title": "Centraal Portaal", "titles": {"cert_viewer": "Certificate / CSR Viewer"}}
+
+    def _tools():
+        return {"tools": [{"id": "certviewer", "name": "Certificate / CSR Viewer", "web_path": "/cert"}]}
+
+    app.register_blueprint(create_blueprint(_settings, _branding, _tools))
+    app.run("127.0.0.1", 5001, debug=True)
