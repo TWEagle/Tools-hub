@@ -30,10 +30,18 @@ import datetime as dt
 import requests
 import jwt
 from jwt.algorithms import RSAAlgorithm
-from flask import Flask, request, render_template_string, send_file
+from flask import Flask, request, render_template_string, send_file, Blueprint
 
-import cynit_theme
-import cynit_layout
+try:
+    from app import theme as cynit_theme
+except Exception:  # pragma: no cover
+    cynit_theme = None
+
+try:
+    from app import layout as cynit_layout
+except Exception:  # pragma: no cover
+    cynit_layout = None
+
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 
@@ -693,7 +701,51 @@ def build_excel(results: Dict[str, List[Dict[str, Any]]]) -> bytes:
 #  Web UI
 # ------------------------------------------------------------
 
-def register_web_routes(app: Flask, settings: Dict[str, Any], tools=None) -> None:
+
+
+# ---- theme fallbacks (if app.theme not available) ----
+if cynit_theme is None:  # pragma: no cover
+    class _ThemeFallback:
+        BASE_DIR = Path(__file__).resolve().parents[1]
+        CONFIG_DIR = BASE_DIR / "config"
+
+        @staticmethod
+        def load_settings() -> dict:
+            path = _ThemeFallback.CONFIG_DIR / "settings.json"
+            try:
+                import json
+                return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+            except Exception:
+                return {}
+
+        @staticmethod
+        def load_tools() -> dict:
+            path = _ThemeFallback.CONFIG_DIR / "tools.json"
+            try:
+                import json
+                return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {"tools": []}
+            except Exception:
+                return {"tools": []}
+    cynit_theme = _ThemeFallback()
+
+# ---- layout fallbacks (if app.layout not available) ----
+if cynit_layout is None:  # pragma: no cover
+    class _LayoutFallback:
+        @staticmethod
+        def common_css(settings: dict) -> str:
+            return "body{font-family:Arial,sans-serif;background:#0b0b0b;color:#ddd;margin:0} .page{padding:20px}"
+        @staticmethod
+        def header_html(settings: dict, title: str, tools=None, right_html: str = "") -> str:
+            return f"<div style='padding:12px 16px;border-bottom:1px solid #222;background:#111'><b>{title}</b></div>"
+        @staticmethod
+        def footer_html(settings: dict) -> str:
+            return "<div style='padding:10px 16px;border-top:1px solid #222;background:#111;text-align:right;font-size:.9em'>© CyNiT 2024 - 2026</div>"
+        @staticmethod
+        def common_js() -> str:
+            return ""
+    cynit_layout = _LayoutFallback()
+
+def _register_routes(bp: Blueprint, settings: Dict[str, Any], tools=None) -> None:
     """
     Integreer deze tool in de bestaande CyNiT Tools Flask-app.
 
@@ -937,7 +989,7 @@ def register_web_routes(app: Flask, settings: Dict[str, Any], tools=None) -> Non
         initial_env = next(iter(envs.keys()))
     log_debug(f"Initial environment: {initial_env}")
 
-    @app.route("/dcbaas-org-export", methods=["GET", "POST"])
+    @bp.route("/dcbaas-org-export", methods=["GET", "POST"])
     def dcbaas_org_export():
         error: Optional[str] = None
         org_input = ""
@@ -1082,6 +1134,16 @@ def register_web_routes(app: Flask, settings: Dict[str, Any], tools=None) -> Non
             token_message=token_message,
         )
 
+
+
+def create_blueprint(get_settings, get_branding, get_tools_cfg) -> Blueprint:
+    """Tools-Hub blueprint factory."""
+    bp = Blueprint("dcbaas_org_export", __name__)
+    settings = get_settings() or {}
+    tools_cfg = get_tools_cfg() or {}
+    tools = tools_cfg.get("tools") if isinstance(tools_cfg, dict) else None
+    _register_routes(bp, settings=settings, tools=tools)
+    return bp
 
 # Standalone web-run (optioneel)
 if __name__ == "__main__":

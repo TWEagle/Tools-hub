@@ -1,383 +1,302 @@
 #!/usr/bin/env python3
 """
-convert_to_ico.py
+tools/convert_to_ico.py  (Tools Hub)
 
-CyNiT Image → ICO Converter
+Image → ICO Converter (brand-agnostic).
 
-- GUI-tool (Tkinter) met filepicker
-- Web-UI via /ico, integreert met CyNiT layout & thema
+Route:
+- GET/POST  /ico
+
+Features:
+- Upload PNG/JPG/GIF/WebP and download a multi-size .ico
+- Choose sizes (comma-separated) and a "contain" mode
+- Optional transparent padding so non-square images become square nicely
+- Uses central layout helpers from app/layout.py if available
+
+Dependencies:
+- Pillow
 """
 
 from __future__ import annotations
 
+import io
 from pathlib import Path
-from io import BytesIO
-from typing import Optional, List, Dict, Any
+from typing import List, Tuple
 
-import tkinter as tk
-from tkinter import filedialog, messagebox
+from flask import Blueprint, request, render_template_string, send_file, make_response
 
-from flask import Flask, Blueprint, render_template_string, request, send_file, make_response
+try:
+    from PIL import Image, ImageOps
+except Exception as e:  # pragma: no cover
+    Image = None
+    ImageOps = None
 
-from PIL import Image
+# ---- optional central layout ----
+try:
+    from app.layout import common_css, header_html, footer_html, common_js
+except Exception:  # pragma: no cover
+    def common_css(settings: dict) -> str:
+        return "body{font-family:Arial,sans-serif;background:#0b0b0b;color:#ddd;margin:0} .page{padding:20px}"
+    def header_html(settings: dict, title: str, tools: list | None = None, right_html: str = "") -> str:
+        return f"<div style='padding:12px 16px;border-bottom:1px solid #222;background:#111'><b>{title}</b></div>"
+    def footer_html(settings: dict) -> str:
+        return "<div style='padding:10px 16px;border-top:1px solid #222;background:#111;text-align:right;font-size:.9em'>© CyNiT 2024 - 2026</div>"
+    def common_js() -> str:
+        return ""
 
-import cynit_theme
-import cynit_layout
+
+DEFAULT_SIZES = "16,24,32,48,64,96,128,256"
 
 
-BASE_DIR = cynit_theme.BASE_DIR
-LOGO_PATH = cynit_theme.LOGO_PATH
-
-
-# =====================================
-#  GUI
-# =====================================
-
-class IcoConverterGUI(tk.Tk):
-    def __init__(self, settings: Dict[str, Any]):
-        super().__init__()
-
-        self.settings = settings
-        colors = settings.get("colors", {})
-        ui = settings.get("ui", {})
-
-        self.bg = colors.get("background", "#000000")
-        self.fg = colors.get("general_fg", "#00FA00")
-        self.title_color = colors.get("title", "#00A2FF")
-
-        self.font_main = ui.get("font_main", "Consolas")
-        self.font_buttons = ui.get("font_buttons", "Segoe UI")
-
-        self.image_path: Optional[Path] = None
-
-        self.title("CyNiT Image → ICO Converter")
-        self.geometry("580x220")
-        self.configure(bg=self.bg)
-
-        self._logo_img = None
-
-        self._build_gui()
-
-    def _build_gui(self) -> None:
-        # Header met logo (zoals cert_viewer GUI doet)
-        header = tk.Frame(self, bg=self.bg)
-        header.pack(fill=tk.X, padx=10, pady=(10, 0))
-
-        left = tk.Frame(header, bg=self.bg)
-        left.pack(side=tk.LEFT, anchor="w")
-
-        if LOGO_PATH.exists():
-            try:
-                from PIL import ImageTk
-                img = Image.open(LOGO_PATH)
-                max_h = self.settings.get("ui", {}).get("logo_max_height", 80)
-                if img.height > 0:
-                    scale = max_h / img.height
-                else:
-                    scale = 1.0
-                new_w = int(img.width * scale)
-                new_h = int(img.height * scale)
-                img_resized = img.resize((new_w, new_h), Image.LANCZOS)
-                self._logo_img = ImageTk.PhotoImage(img_resized)
-                logo_label = tk.Label(left, image=self._logo_img, bg=self.bg)
-                logo_label.pack(side=tk.LEFT)
-            except Exception:
-                pass
-
-        title_lbl = tk.Label(
-            header,
-            text="Image → ICO Converter",
-            bg=self.bg,
-            fg=self.title_color,
-            font=(self.font_main, 16, "bold"),
-        )
-        title_lbl.pack(side=tk.LEFT, padx=10)
-
-        frame = tk.Frame(self, bg=self.bg)
-        frame.pack(padx=20, pady=10, fill=tk.BOTH, expand=True)
-
-        btn_select = tk.Button(
-            frame,
-            text="📁 Afbeelding kiezen…",
-            command=self.choose_image,
-            bg=self.settings["colors"].get("button_bg", "#111111"),
-            fg=self.settings["colors"].get("button_fg", "#00B7C3"),
-            activebackground=self.settings["colors"].get("button_bg", "#111111"),
-            activeforeground=self.settings["colors"].get("button_fg", "#00B7C3"),
-            font=(self.font_buttons, 11, "bold"),
-            relief=tk.RAISED,
-            bd=3,
-        )
-        btn_select.pack(pady=5, anchor="w")
-
-        self.lbl_file = tk.Label(
-            frame,
-            text="Geen afbeelding geselecteerd",
-            bg=self.bg,
-            fg=self.fg,
-            font=(self.font_main, 10),
-            anchor="w",
-            justify="left",
-        )
-        self.lbl_file.pack(pady=5, fill=tk.X)
-
-        btn_convert = tk.Button(
-            frame,
-            text="➡ Converteer naar ICO",
-            command=self.convert,
-            bg=self.settings["colors"].get("button_bg", "#111111"),
-            fg=self.settings["colors"].get("button_fg", "#00B7C3"),
-            activebackground=self.settings["colors"].get("button_bg", "#111111"),
-            activeforeground=self.settings["colors"].get("button_fg", "#00B7C3"),
-            font=(self.font_buttons, 11, "bold"),
-            relief=tk.RAISED,
-            bd=3,
-        )
-        btn_convert.pack(pady=(10, 5), anchor="w")
-
-        hint = tk.Label(
-            frame,
-            text="Ondersteund: PNG, JPG, JPEG, GIF → ico (16–256 px).",
-            bg=self.bg,
-            fg=self.fg,
-            font=(self.font_main, 9),
-            anchor="w",
-            justify="left",
-        )
-        hint.pack(pady=(5, 0), fill=tk.X)
-
-    def choose_image(self) -> None:
-        filetypes = [
-            ("Afbeeldingen", "*.png *.jpg *.jpeg *.gif"),
-            ("PNG", "*.png"),
-            ("JPEG", "*.jpg *.jpeg"),
-            ("GIF", "*.gif"),
-            ("Alle bestanden", "*.*"),
-        ]
-
-        filename = filedialog.askopenfilename(
-            title="Kies een afbeelding",
-            filetypes=filetypes,
-        )
-
-        if filename:
-            self.image_path = Path(filename)
-            self.lbl_file.config(text=str(self.image_path))
-
-    def convert(self) -> None:
-        if not self.image_path:
-            messagebox.showwarning("Geen afbeelding", "Kies eerst een afbeelding.")
-            return
-
+def _parse_sizes(s: str) -> List[int]:
+    out: List[int] = []
+    for part in (s or "").replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
         try:
-            img = Image.open(self.image_path)
-        except Exception as e:
-            messagebox.showerror("Fout", f"Fout bij openen afbeelding:\n{e}")
-            return
-
-        save_path = filedialog.asksaveasfilename(
-            title="Opslaan als ICO",
-            defaultextension=".ico",
-            filetypes=[("ICO file", "*.ico")],
-            initialfile=self.image_path.stem + ".ico",
-        )
-
-        if not save_path:
-            return
-
-        sizes = [(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
-
-        try:
-            img.save(save_path, format="ICO", sizes=sizes)
-            messagebox.showinfo("Succes", f"ICO opgeslagen als:\n{save_path}")
-        except Exception as e:
-            messagebox.showerror("Fout", f"Kon ICO niet opslaan:\n{e}")
+            n = int(part)
+        except ValueError:
+            continue
+        if 8 <= n <= 512 and n not in out:
+            out.append(n)
+    if not out:
+        out = [16, 24, 32, 48, 64, 96, 128, 256]
+    return out
 
 
-def run_gui() -> None:
-    settings = cynit_theme.load_settings()
-    gui = IcoConverterGUI(settings)
-    gui.mainloop()
+def _safe_stem(filename: str) -> str:
+    stem = Path(filename or "icon").stem or "icon"
+    safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in stem)
+    return safe[:80] or "icon"
 
 
-# =====================================
-#  WEB
-# =====================================
+def _make_square(img: "Image.Image", pad_color=(0, 0, 0, 0)) -> "Image.Image":
+    """
+    Center-pad to square without distortion.
+    """
+    w, h = img.size
+    if w == h:
+        return img
+    side = max(w, h)
+    out = Image.new("RGBA", (side, side), pad_color)
+    out.paste(img, ((side - w) // 2, (side - h) // 2))
+    return out
 
-bp = Blueprint("icoconverter", __name__)
+
+def _contain(img: "Image.Image", size: int) -> "Image.Image":
+    """
+    Scale to fit within size x size, preserving aspect.
+    """
+    return ImageOps.contain(img, (size, size), method=Image.LANCZOS)
 
 
-@bp.route("/ico", methods=["GET", "POST"])
-def ico_index():
-    settings = cynit_theme.load_settings()
-    colors = settings.get("colors", {})
-    ui = settings.get("ui", {})
+def _center_on_canvas(img: "Image.Image", size: int, bg=(0, 0, 0, 0)) -> "Image.Image":
+    """
+    Place img centered on size x size canvas.
+    """
+    out = Image.new("RGBA", (size, size), bg)
+    w, h = img.size
+    out.paste(img, ((size - w) // 2, (size - h) // 2), img if img.mode == "RGBA" else None)
+    return out
 
-    base_css = cynit_layout.common_css(settings)
-    common_js = cynit_layout.common_js()
 
-    tools_cfg = cynit_theme.load_tools()
-    tools = tools_cfg.get("tools", [])
+def _build_ico_bytes(img: "Image.Image", sizes: List[int], mode: str, pad: bool) -> bytes:
+    """
+    mode:
+      - "crop"   -> square crop (fills canvas)
+      - "contain"-> keep aspect + padding to square
+    pad: if True, first make source square by padding (helps before resizing)
+    """
+    if img.mode not in ("RGBA", "RGB"):
+        img = img.convert("RGBA")
+    else:
+        img = img.convert("RGBA")
 
-    header_html = cynit_layout.header_html(
-        settings,
-        tools=tools,
-        title="CyNiT Image → ICO Converter",
-        right_html="",
-    )
-    footer_html = cynit_layout.footer_html()
+    # normalize orientation (EXIF)
+    try:
+        img = ImageOps.exif_transpose(img)
+    except Exception:
+        pass
 
-    error: Optional[str] = None
-    info: Optional[str] = None
+    if pad:
+        img = _make_square(img)
 
-    ico_bytes: Optional[bytes] = None
-    ico_name: Optional[str] = None
-
-    if request.method == "POST":
-        file = request.files.get("file")
-        if not file or file.filename == "":
-            error = "Geen bestand geselecteerd."
+    ico_imgs: List["Image.Image"] = []
+    for s in sizes:
+        if mode == "contain":
+            scaled = _contain(img, s)
+            framed = _center_on_canvas(scaled, s)
+            ico_imgs.append(framed)
         else:
-            try:
-                data = file.read()
-                img = Image.open(BytesIO(data))
-                out = BytesIO()
+            # crop to square and resize
+            cropped = ImageOps.fit(img, (s, s), method=Image.LANCZOS, centering=(0.5, 0.5))
+            ico_imgs.append(cropped)
 
-                sizes = [(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
-                img.save(out, format="ICO", sizes=sizes)
-                out.seek(0)
-                ico_bytes = out.read()
-                ico_name = Path(file.filename).stem + ".ico"
-                info = f"Afbeelding succesvol geconverteerd naar {ico_name}."
-            except Exception as e:
-                error = f"Fout bij converteren: {e}"
+    # Pillow can save ICO with multiple sizes using sizes=
+    bio = io.BytesIO()
+    base = ico_imgs[-1] if ico_imgs else img
+    size_tuples: List[Tuple[int, int]] = [(s, s) for s in sizes]
+    base.save(bio, format="ICO", sizes=size_tuples)
+    return bio.getvalue()
 
-    template = f"""
+
+def create_blueprint(get_settings, get_branding, get_tools_cfg) -> Blueprint:
+    bp = Blueprint("ico_converter", __name__)
+
+    @bp.route("/ico", methods=["GET", "POST"])
+    def index():
+        settings = get_settings() or {}
+        branding = get_branding() or {}
+        tools_cfg = get_tools_cfg() or {"tools": []}
+        tools = tools_cfg.get("tools", []) if isinstance(tools_cfg, dict) else []
+
+        title = (branding.get("titles", {}) or {}).get("ico_converter") \
+                or branding.get("app_title") \
+                or "Image → ICO Converter"
+
+        base_css = common_css(settings)
+        js = common_js()
+        header = header_html(settings, title=title, tools=tools, right_html="")
+        footer = footer_html(settings)
+
+        err = None
+
+        sizes_str = (request.form.get("sizes") or DEFAULT_SIZES).strip()
+        mode = (request.form.get("mode") or "contain").strip().lower()
+        pad = (request.form.get("pad") == "1")
+
+        if request.method == "POST":
+            if Image is None:
+                return make_response("Pillow ontbreekt. Installeer 'pillow' in je venv.", 500)
+
+            up = request.files.get("file")
+            if not up or not up.filename:
+                err = "Geen afbeelding gekozen."
+            else:
+                try:
+                    sizes = _parse_sizes(sizes_str)
+                    if mode not in ("contain", "crop"):
+                        mode = "contain"
+
+                    raw = up.read()
+                    img = Image.open(io.BytesIO(raw))
+                    out = _build_ico_bytes(img, sizes=sizes, mode=mode, pad=pad)
+
+                    safe = _safe_stem(up.filename)
+                    dl = f"{safe}.ico"
+                    bio = io.BytesIO(out)
+                    bio.seek(0)
+                    return send_file(
+                        bio,
+                        as_attachment=True,
+                        download_name=dl,
+                        mimetype="image/x-icon",
+                    )
+                except Exception as e:
+                    err = f"Conversie faalde: {e}"
+
+        tmpl = """
 <!doctype html>
 <html lang="nl">
 <head>
   <meta charset="utf-8">
-  <title>CyNiT Image → ICO Converter</title>
-  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <title>{{ page_title }}</title>
   <style>
-    {base_css}
-
-    .card {{
-      max-width: 700px;
-      margin: 0 auto 20px auto;
-      background: #1e1e1e;
-      padding: 20px;
-      border-radius: 16px;
-      box-shadow: 0 10px 30px rgba(0,0,0,0.6);
-    }}
-    .muted {{ color:#aaa; font-size:0.9em; }}
-    .flash-error {{
-      background:#331111;
-      border:1px solid #aa3333;
-      color:#ffaaaa;
-      padding:8px 12px;
-      border-radius:8px;
-      margin-bottom:10px;
-    }}
-    .flash-ok {{
-      background:#112211;
-      border:1px solid #22aa33;
-      color:#aaffaa;
-      padding:8px 12px;
-      border-radius:8px;
-      margin-bottom:10px;
-    }}
+    {{ base_css|safe }}
+    .card { background:#0a0a0a; border:1px solid #222; border-radius:16px; padding:16px; }
+    input[type="file"], input[type="text"], select {
+      width:100%; padding:10px; border-radius:12px; border:1px solid #333;
+      background:#0b0b0b; color:#ddd;
+    }
+    .grid { display:grid; grid-template-columns: 1.2fr 1fr; gap:14px; }
+    .row { display:grid; grid-template-columns: 1fr 1fr 1fr; gap:12px; align-items:end; }
+    .muted{ opacity:.85; }
+    .flash-err { background:#221111; border:1px solid #aa3333; padding:10px 12px; border-radius:12px; margin:12px 0; color:#fecaca; }
+    .tool-btn{
+      display:inline-block; padding:10px 14px; border-radius:12px;
+      border:1px solid #333; background:#111; color:#ddd; text-decoration:none; cursor:pointer;
+    }
+    .tool-btn:hover{ border-color: rgba(0,247,0,.35); }
+    .btnrow{ display:flex; flex-wrap:wrap; gap:10px; margin-top:12px; }
+    .help { font-size:.92rem; color:#aab; }
+    code { background:#111; border:1px solid #222; padding:2px 6px; border-radius:8px; }
   </style>
-  <script>
-    {common_js}
-  </script>
+  <script>{{ js|safe }}</script>
 </head>
 <body>
-  {header_html}
+  {{ header|safe }}
   <div class="page">
     <div class="card">
-      <h1>Image → ICO Converter</h1>
-      <p class="muted">
-        Upload een afbeelding (PNG, JPG, JPEG, GIF) en download een .ico in meerdere formaten (16–256px).
-      </p>
+      <h1 style="margin-top:0">{{ page_title }}</h1>
+      <p class="muted">Upload een afbeelding en download een multi-size <code>.ico</code> bestand.</p>
 
-      {{% if error %}}
-        <div class="flash-error">{{{{ error }}}}</div>
-      {{% endif %}}
-
-      {{% if info %}}
-        <div class="flash-ok">{{{{ info }}}}</div>
-      {{% endif %}}
+      {% if err %}
+        <div class="flash-err">{{ err }}</div>
+      {% endif %}
 
       <form method="post" enctype="multipart/form-data">
-        <label>Afbeelding uploaden:</label><br>
-        <input type="file" name="file" accept=".png,.jpg,.jpeg,.gif" /><br><br>
-        <button type="submit">Converteer naar ICO</button>
-      </form>
+        <div class="grid">
+          <div>
+            <label><strong>Afbeelding</strong></label>
+            <input type="file" name="file" accept="image/*">
+            <div class="help" style="margin-top:8px;">PNG/JPG/GIF/WebP. Transparantie blijft behouden (waar mogelijk).</div>
+          </div>
+          <div>
+            <label><strong>Sizes</strong></label>
+            <input type="text" name="sizes" value="{{ sizes_str }}" placeholder="16,24,32,48,64,128,256">
+            <div class="help" style="margin-top:8px;">
+              Komma-separated. Typical: <code>{{ default_sizes }}</code>
+            </div>
+          </div>
+        </div>
 
-      {{% if ico_available %}}
-        <hr>
-        <p>Download je ICO bestand:</p>
-        <a href="{{{{ download_url }}}}">⬇ {{{{ ico_name }}}}</a>
-      {{% endif %}}
+        <div class="row" style="margin-top:14px;">
+          <div>
+            <label><strong>Mode</strong></label>
+            <select name="mode">
+              <option value="contain" {{ 'selected' if mode=='contain' else '' }}>Contain (geen vervorming, padding)</option>
+              <option value="crop" {{ 'selected' if mode=='crop' else '' }}>Crop (vult volledig, kan afsnijden)</option>
+            </select>
+          </div>
+          <div>
+            <label><strong>Pad to square</strong></label>
+            <label class="help" style="display:flex;gap:10px;align-items:center;">
+              <input type="checkbox" name="pad" value="1" {{ 'checked' if pad else '' }}>
+              Eerst padding naar vierkant (handig bij heel brede/hoge images)
+            </label>
+          </div>
+          <div class="btnrow" style="justify-content:flex-end;">
+            <button class="tool-btn" type="submit">Convert → ICO</button>
+          </div>
+        </div>
+      </form>
+    </div>
+
+    <div class="card" style="margin-top:16px;">
+      <h2 style="margin-top:0">Tips</h2>
+      <ul class="help">
+        <li>Voor Windows app icons: gebruik zeker <code>16,24,32,48,64,128,256</code>.</li>
+        <li>Als je logo niet vierkant is: kies <b>Contain</b> en zet <b>Pad to square</b> aan.</li>
+      </ul>
     </div>
   </div>
-  {footer_html}
+  {{ footer|safe }}
 </body>
 </html>
-"""
-
-    download_url = ""
-    ico_available = False
-
-    if ico_bytes and ico_name:
-        # We sturen het bestand direct terug als download-response
-        # (geen aparte route; de POST-response is de download)
-        buf = BytesIO(ico_bytes)
-        buf.seek(0)
-        return send_file(
-            buf,
-            as_attachment=True,
-            download_name=ico_name,
-            mimetype="image/x-icon",
+        """
+        return render_template_string(
+            tmpl,
+            base_css=base_css,
+            js=js,
+            header=header,
+            footer=footer,
+            page_title=title,
+            err=err,
+            sizes_str=sizes_str,
+            default_sizes=DEFAULT_SIZES,
+            mode=mode,
+            pad=pad,
         )
 
-    # Geen bestand (GET of fout) → gewone pagina tonen
-    return render_template_string(
-        template,
-        error=error,
-        info=info,
-        ico_available=ico_available,
-        download_url=download_url,
-        ico_name=ico_name or "",
-        tools=tools,
-    )
-
-
-def register_web_routes(app: Flask, settings: Dict[str, Any], tools: Optional[List[Dict[str, Any]]] = None) -> None:
-    """
-    Registert /ico in een bestaande Flask app (ctools).
-    """
-    app.register_blueprint(bp)
-
-
-# =====================================
-#  Standalone run
-# =====================================
-
-def run_web() -> None:
-    settings = cynit_theme.load_settings()
-    tools_cfg = cynit_theme.load_tools()
-    tools = tools_cfg.get("tools", [])
-
-    app = Flask(__name__)
-    register_web_routes(app, settings, tools)
-    app.run(host="127.0.0.1", port=5450, debug=True)
-
-
-if __name__ == "__main__":
-    import sys
-    if "--gui" in sys.argv:
-        run_gui()
-    else:
-        run_web()
+    return bp
